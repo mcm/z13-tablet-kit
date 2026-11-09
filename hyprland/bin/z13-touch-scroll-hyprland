@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Hyprland front end for z13-touch-scroll.
+
+Loads the upstream daemon (installed next to this file) unchanged and replaces
+its two KScreen-dependent pieces:
+
+- internal_display(): reads the panel's rotation and scale from hyprctl
+  instead of kscreen-doctor.
+- emit_context_menu(): places the pointer with `hyprctl dispatch movecursor`
+  (absolute, layout-aware, no pointer acceleration) instead of clamping a
+  relative pointer to the top-left and moving it from there.
+
+Two-finger scrolling itself is plain evdev/uinput and runs as upstream wrote it.
+"""
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+UPSTREAM = Path(__file__).resolve().parent / "z13-touch-scroll"
+_loader = importlib.machinery.SourceFileLoader("z13_touch_scroll", str(UPSTREAM))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+ts = importlib.util.module_from_spec(_spec)
+_loader.exec_module(ts)
+evdev = ts.evdev
+
+CONF = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) \
+    / "z13-tablet-kit/hyprland.env"
+
+# wl_output transform (what Hyprland reports) -> KScreen rotation code that
+# upstream's to_logical() expects: 1 none, 2 left (90 CCW), 4 inverted, 8 right.
+# Flipped transforms (4-7) are not used by iio-hyprland and are skipped.
+# If right-clicks land mirrored after rotating, swap the 1 and 3 entries.
+TRANSFORM_TO_KSCREEN = {0: 1, 1: 2, 2: 4, 3: 8}
+
+
+def setting(name, default):
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        for line in CONF.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].strip().strip("'\"") or default
+    except OSError:
+        pass
+    return default
+
+
+MONITOR = setting("Z13_MONITOR", "eDP-1")
+
+
+def ensure_hyprland_env():
+    """A user service can start before uwsm exports Hyprland's environment."""
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    sockets = glob.glob(f"{runtime}/hypr/*/.socket.sock")
+    if sockets:
+        newest = max(sockets, key=os.path.getmtime)
+        os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = Path(newest).parent.name
+
+
+def internal_monitor():
+    ensure_hyprland_env()
+    try:
+        result = subprocess.run(["hyprctl", "monitors", "-j"],
+                                capture_output=True, text=True, timeout=2)
+        for monitor in json.loads(result.stdout):
+            if monitor.get("name") == MONITOR and not monitor.get("disabled"):
+                return monitor
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def internal_display():
+    """(rotation, scale) of the internal panel in upstream's KScreen terms, or None."""
+    monitor = internal_monitor()
+    if monitor is None:
+        return None
+    rotation = TRANSFORM_TO_KSCREEN.get(monitor.get("transform"))
+    if rotation is None:
+        return None
+    return rotation, monitor["scale"]
+
+
+def emit_context_menu(state, ui):
+    """Move the pointer to the touch centroid and right-click."""
+    xs = [p[0] for p in state["positions"].values() if p[0] is not None]
+    ys = [p[1] for p in state["positions"].values() if p[1] is not None]
+    if not xs or not ys:
+        return
+    monitor = internal_monitor()
+    rotation = TRANSFORM_TO_KSCREEN.get(monitor.get("transform")) if monitor else None
+    if rotation is None:
+        # A right-click at a guessed position is worse than none.
+        print("hold: skipped, internal display state unavailable",
+              file=sys.stderr, flush=True)
+        return
+    px, py = ts.to_logical(sum(xs) / len(xs), sum(ys) / len(ys),
+                           rotation, monitor["scale"])
+    x, y = round(monitor["x"] + px), round(monitor["y"] + py)
+    try:
+        subprocess.run(["hyprctl", "dispatch", "movecursor", str(x), str(y)],
+                       capture_output=True, timeout=2, check=True)
+    except (OSError, subprocess.SubprocessError):
+        print("hold: skipped, could not move the pointer", file=sys.stderr, flush=True)
+        return
+    time.sleep(0.05)
+    ui.write(evdev.ecodes.EV_KEY, evdev.ecodes.BTN_RIGHT, 1)
+    ui.syn()
+    time.sleep(0.05)
+    ui.write(evdev.ecodes.EV_KEY, evdev.ecodes.BTN_RIGHT, 0)
+    ui.syn()
+    print(f"hold: EMIT right-click @ {x},{y}", file=sys.stderr, flush=True)
+
+
+ts.internal_display = internal_display
+ts.emit_context_menu = emit_context_menu
+
+if __name__ == "__main__":
+    ts.main()

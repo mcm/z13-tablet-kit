@@ -1,0 +1,23 @@
+#!/bin/bash
+# Toggle the on-screen keyboard. Bind it in Hyprland, e.g.:
+#   bind = SUPER CTRL, K, exec, z13-osk
+# In tablet posture dock keeps wvkbd running hidden, so this just shows/hides it.
+# Outside tablet posture it starts a visible keyboard (dock closes it again on
+# the next posture change).
+set -u
+Z13_OSK_CMD="wvkbd-mobintl --hidden"
+Z13_OSK_PROC=wvkbd-mobintl
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/z13-tablet-kit/hyprland.env"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+pids=$(pgrep -u "$(id -u)" -x "$Z13_OSK_PROC")
+if [ -n "$pids" ]; then
+	# wvkbd: SIGUSR1 hides, SIGUSR2 shows, SIGRTMIN toggles.
+	# shellcheck disable=SC2086
+	kill -s RTMIN $pids
+else
+	# Start shown: drop --hidden from the configured command.
+	cmd=${Z13_OSK_CMD//--hidden/}
+	hyprctl dispatch exec "$cmd" >/dev/null 2>&1 || setsid -f $cmd >/dev/null 2>&1
+fi

@@ -1,0 +1,159 @@
+#!/bin/bash
+# Hyprland variant of dock. Applies a desktop / laptop / tablet posture supplied
+# by z13-tablet-switch, with the same interface as the Plasma dock:
+#
+#   dock {desktop|laptop|tablet} [disable-touch-in-desktop]
+#
+# - Touchscreen: off in desktop posture (unless the setting says otherwise).
+# - Internal panel: scale follows posture; rotation resets to normal outside tablet.
+# - Auto-rotate (iio-hyprland) and the on-screen keyboard (wvkbd) run only in tablet.
+#
+# z13-tablet-switch re-runs this every 5 minutes for recovery, so every step is
+# idempotent, and display changes happen only on a real posture change (or after
+# Hyprland restarts) so a periodic re-run never fights iio-hyprland's rotation.
+set -u
+
+RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/z13-tablet-kit"
+STATEF="$RUNDIR/posture"
+APPLIEDF="$RUNDIR/hyprland-applied"
+UID_NUM=$(id -u)
+
+# Defaults. Override any of these in ~/.config/z13-tablet-kit/hyprland.env.
+# Scales must divide 2560x1600 evenly or Hyprland rejects them (1.6 and 2 do; 1.75 doesn't).
+Z13_MONITOR=eDP-1
+Z13_MODE=highrr
+Z13_SCALE_DESKTOP=1.6
+Z13_SCALE_LAPTOP=1.6
+Z13_SCALE_TABLET=2
+Z13_ROTATE_CMD=iio-hyprland
+Z13_ROTATE_PROC=iio-hyprland
+Z13_OSK_CMD="wvkbd-mobintl --hidden"
+Z13_OSK_PROC=wvkbd-mobintl
+Z13_TOUCH_MATCH=elan9008
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/z13-tablet-kit/hyprland.env"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+case "${1-}" in
+	desktop|laptop|tablet) state=$1 ;;
+	*) echo "usage: dock {desktop|laptop|tablet} [disable-touch-in-desktop]" >&2; exit 2 ;;
+esac
+case "${2-true}" in
+	true|false) disable_touch_in_desktop=${2-true} ;;
+	*) echo "dock: disable-touch-in-desktop must be true or false" >&2; exit 2 ;;
+esac
+
+mkdir -p "$RUNDIR"
+chmod 700 "$RUNDIR"
+prev=$(cat "$STATEF" 2>/dev/null || true)
+
+# A systemd user service may start before uwsm exports Hyprland's environment.
+if [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+	# Newest instance first; instance signatures never contain spaces.
+	# shellcheck disable=SC2045
+	for d in $(ls -td "${XDG_RUNTIME_DIR:-/run/user/$UID_NUM}"/hypr/*/ 2>/dev/null); do
+		if [ -S "$d/.socket.sock" ]; then
+			HYPRLAND_INSTANCE_SIGNATURE=$(basename "$d")
+			export HYPRLAND_INSTANCE_SIGNATURE
+			break
+		fi
+	done
+fi
+if ! hyprctl version >/dev/null 2>&1; then
+	echo "dock: Hyprland unavailable" >&2
+	exit 1
+fi
+
+# --- touchscreen ---------------------------------------------------------------
+touch_name=$(hyprctl devices -j 2>/dev/null | Z13_TOUCH_MATCH="$Z13_TOUCH_MATCH" python3 -c '
+import json, os, sys
+match = os.environ["Z13_TOUCH_MATCH"].lower()
+try:
+    devices = json.load(sys.stdin).get("touch", [])
+except ValueError:
+    devices = []
+for d in devices:
+    name = d.get("name", "")
+    if match in name.lower() and "stylus" not in name.lower():
+        print(name)
+        break
+')
+if [ -z "$touch_name" ]; then
+	echo "dock: touchscreen unavailable" >&2
+	exit 1
+fi
+want=true
+if [ "$state" = desktop ] && [ "$disable_touch_in_desktop" = true ]; then want=false; fi
+out=$(hyprctl keyword "device[$touch_name]:enabled" "$want" 2>&1)
+if [ "$out" != ok ]; then
+	echo "dock: touchscreen update failed: $out" >&2
+	exit 1
+fi
+
+# --- internal panel: scale and rotation (only on a real change) -----------------
+key="$state $HYPRLAND_INSTANCE_SIGNATURE"
+if [ "$(cat "$APPLIEDF" 2>/dev/null)" != "$key" ]; then
+	case "$state" in
+		desktop) scale=$Z13_SCALE_DESKTOP ;;
+		laptop)  scale=$Z13_SCALE_LAPTOP ;;
+		tablet)  scale=$Z13_SCALE_TABLET ;;
+	esac
+	# Current position, scale and transform of the panel: "x y scale transform".
+	read -r mx my mscale mtransform < <(hyprctl monitors -j 2>/dev/null | \
+		Z13_MONITOR="$Z13_MONITOR" python3 -c '
+import json, os, sys
+try:
+    monitors = json.load(sys.stdin)
+except ValueError:
+    monitors = []
+for m in monitors:
+    if m.get("name") == os.environ["Z13_MONITOR"]:
+        print(m["x"], m["y"], m["scale"], m["transform"])
+        break
+')
+	if [ -z "${mx:-}" ]; then
+		echo "dock: monitor $Z13_MONITOR unavailable" >&2
+		exit 1
+	fi
+	[ -n "$scale" ] || scale=$mscale  # empty setting = leave scale alone
+	if [ "$state" = tablet ]; then
+		transform=$mtransform  # keep it; iio-hyprland owns rotation in tablet
+	else
+		pkill -u "$UID_NUM" -x "$Z13_ROTATE_PROC" >/dev/null 2>&1 || true
+		transform=0
+	fi
+	batch="keyword monitor $Z13_MONITOR,$Z13_MODE,${mx}x${my},$scale,transform,$transform"
+	if [ "$state" != tablet ]; then
+		batch="$batch; keyword input:touchdevice:transform 0; keyword input:tablet:transform 0"
+	fi
+	if ! hyprctl --batch "$batch" >/dev/null 2>&1; then
+		echo "dock: display update failed ($batch)" >&2
+		exit 1
+	fi
+	printf '%s\n' "$key" > "$APPLIEDF"
+fi
+
+# --- tablet-only helpers (ensured on every run, so they come back after a crash) ---
+# Started through Hyprland so they get its environment and outlive this service.
+if [ "$state" = tablet ]; then
+	if ! pgrep -u "$UID_NUM" -x "$Z13_ROTATE_PROC" >/dev/null 2>&1 && [ -n "$Z13_ROTATE_CMD" ]; then
+		hyprctl dispatch exec "$Z13_ROTATE_CMD" >/dev/null 2>&1
+	fi
+	if ! pgrep -u "$UID_NUM" -x "$Z13_OSK_PROC" >/dev/null 2>&1 && [ -n "$Z13_OSK_CMD" ]; then
+		hyprctl dispatch exec "$Z13_OSK_CMD" >/dev/null 2>&1
+	fi
+else
+	pkill -u "$UID_NUM" -x "$Z13_ROTATE_PROC" >/dev/null 2>&1 || true
+	pkill -u "$UID_NUM" -x "$Z13_OSK_PROC" >/dev/null 2>&1 || true
+fi
+
+# --- publish posture (z13-touch-scroll reads this) -------------------------------
+tmp="$STATEF.tmp.$$"
+if ! printf '%s\n' "$state" > "$tmp" || ! mv -f "$tmp" "$STATEF"; then
+	rm -f "$tmp"
+	echo "dock: $state pending (posture state write failed, touch=$want)" >&2
+	exit 1
+fi
+if [ "$prev" != "$state" ]; then
+	echo "dock: $state (touch=$want)"
+fi
