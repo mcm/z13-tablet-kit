@@ -20,7 +20,8 @@ python3 -c 'import evdev' 2>/dev/null || { echo "ERROR: python-evdev required  -
 command -v hyprctl >/dev/null || { echo "ERROR: hyprctl not found (is this a Hyprland system?)"; exit 1; }
 command -v iio-hyprland >/dev/null || echo "NOTE: iio-hyprland not installed (auto-rotate)  ->  yay -S iio-hyprland-git"
 command -v monitor-sensor >/dev/null || echo "NOTE: iio-sensor-proxy not installed (iio-hyprland needs it)  ->  sudo pacman -S iio-sensor-proxy"
-command -v wvkbd-mobintl >/dev/null || echo "NOTE: wvkbd not installed (on-screen keyboard)  ->  yay -S wvkbd"
+command -v wvkbd-deskintl >/dev/null || command -v wvkbd-mobintl >/dev/null || \
+	echo "NOTE: wvkbd not installed (on-screen keyboard)  ->  yay -S wvkbd-deskintl"
 command -v z13ctl-plus >/dev/null || [ -x "$BIN/z13ctl-plus" ] || \
 	echo "NOTE: z13ctl-plus not installed. Optional here; posture works without it (expect harmless 'tablet integration report failed' log lines)."
 id -nG | grep -qw users || echo "NOTE: folio touchpad opt-in needs 'sudo usermod -aG users $USER' and a re-login"
@@ -43,10 +44,19 @@ sudo install -Dm644 "$KIT/udev/70-elan-touchscreen-uaccess.rules" /etc/udev/rule
 sudo install -Dm644 "$KIT/udev/99-disable-asus-touchpad.rules"    /etc/udev/rules.d/99-disable-asus-touchpad.rules
 
 # --- conflicts with other Z13 guides ---
-if grep -rqsE '^[[:space:]]*exec-once.*(iio-hyprland|wvkbd)' "$HOME/.config/hypr"; then
-	echo "WARNING: your Hyprland config starts iio-hyprland or wvkbd with exec-once."
+# Autostart lines (exec-once in hyprland.conf, launch_on_start in Lua). Files that
+# already know about this kit (omarchy-rog-z13-setup's z13.lua checks for
+# z13-touch-scroll-hyprland and steps aside) are skipped.
+autostart_re='^[[:space:]]*(exec-once|o\.launch_on_start|hl\.exec_once).*(iio-hyprland|wvkbd)'
+conflicts=$(grep -rlsE "$autostart_re" "$HOME/.config/hypr" | while read -r f; do
+	grep -q 'z13-touch-scroll-hyprland' "$f" || echo "$f"
+done)
+if [ -n "$conflicts" ]; then
+	echo "WARNING: your Hyprland config starts iio-hyprland or wvkbd at login."
 	echo "         Remove those lines; dock now runs them in tablet posture only:"
-	grep -rnsE '^[[:space:]]*exec-once.*(iio-hyprland|wvkbd)' "$HOME/.config/hypr" | sed 's/^/           /'
+	for f in $conflicts; do
+		grep -nsE "$autostart_re" "$f" | sed "s|^|           $f:|"
+	done
 fi
 
 # --- reload + enable ---
@@ -61,7 +71,14 @@ echo "    • desktop/laptop/tablet posture, touch toggle, per-posture scale (z1
 echo "    • auto-rotate and on-screen keyboard in tablet posture only"
 echo "    • 2-finger touch scroll                           (z13-touch-scroll)"
 echo "    • folio touchpad disabled (jumping-cursor bug)    (udev inhibited)"
-echo "    Add a keyboard toggle to ~/.config/hypr/bindings.conf, e.g.:"
-echo "        bind = SUPER CTRL, K, exec, z13-osk"
+if [ -f "$HOME/.config/hypr/z13.lua" ] && grep -q 'z13-osk' "$HOME/.config/hypr/z13.lua"; then
+	echo "    Keyboard toggle: SUPER+V (from omarchy-rog-z13-setup's z13.lua; run 'hyprctl reload' once)"
+elif [ -f "$HOME/.config/hypr/hyprland.lua" ]; then
+	echo "    Add a keyboard toggle to your Lua config, e.g.:"
+	echo "        o.bind(\"SUPER + CTRL + K\", \"Virtual keyboard\", os.getenv(\"HOME\") .. \"/.local/bin/z13-osk\")"
+else
+	echo "    Add a keyboard toggle to ~/.config/hypr/bindings.conf, e.g.:"
+	echo "        bind = SUPER CTRL, K, exec, z13-osk"
+fi
 echo "    Settings: $CONF_DIR/hyprland.env"
 echo "    Log: journalctl --user -u z13-tablet-switch   |   posture: cat ${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/z13-tablet-kit/posture"
